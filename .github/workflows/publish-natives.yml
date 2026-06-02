@@ -39,9 +39,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macos-13 is the Intel runner; macos-14 is Apple Silicon. Each builds its native arch
-          # (no cross-compile), so the binary matches the runner it was produced on.
-          - { runner: macos-13, classifier: darwin-x86_64, arch: x86_64 }
+          # Both build on macos-14 (Apple Silicon). The arm64 entry builds natively; the x86_64
+          # entry cross-compiles via CMAKE_OSX_ARCHITECTURES (clang targets x86_64 from arm64 —
+          # the project is pure C with no try_run checks, so cross-compiling is safe). This avoids
+          # the scarce/deprecated macos-13 Intel runner, which would not allocate.
+          - { runner: macos-14, classifier: darwin-x86_64, arch: x86_64 }
           - { runner: macos-14, classifier: darwin-aarch64, arch: arm64 }
     runs-on: ${{ matrix.runner }}
     steps:
