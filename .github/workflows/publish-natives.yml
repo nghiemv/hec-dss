@@ -7,8 +7,10 @@ name: publish-natives
 #
 # One-time setup on the fork:
 #   * Settings > Actions > General: enable Actions (forks start disabled).
-#   * Settings > Secrets and variables > Actions: add NEXUS_USER and NEXUS_PASSWORD with
-#     deploy rights to the maven-releases repository.
+#   * Settings > Environments: create environment `nexus-release`; add secrets NEXUS_USER and
+#     NEXUS_PASSWORD to it (deploy rights to maven-releases), plus any protection rules
+#     (required reviewers, allowed branches). The deploy job below references that environment,
+#     so the build/verify runs need no secrets and only the deploy is gated.
 #
 # Correctness: build from the source revision that matches the target version so the dylib is
 # ABI/behaviour-compatible with the published win/linux libraries of the same version. The
@@ -73,24 +75,41 @@ jobs:
           name: hecdss-${{ matrix.classifier }}
           path: hecdss-${{ inputs.version }}-${{ matrix.classifier }}.zip
 
-      - name: Deploy to HEC Nexus
-        if: ${{ inputs.deploy }}
+  deploy:
+    needs: build
+    if: ${{ inputs.deploy }}
+    runs-on: ubuntu-latest
+    # Gating the deploy behind a protected environment keeps the Nexus write creds out of the
+    # build/verify runs and lets you require approval / restrict branches before a publish. The
+    # zips are platform-agnostic blobs, so a single ubuntu job uploads both arch artifacts.
+    environment: nexus-release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Deploy darwin zips to HEC Nexus
         env:
           NEXUS_USER: ${{ secrets.NEXUS_USER }}
           NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
         run: |
           if [ -z "$NEXUS_USER" ] || [ -z "$NEXUS_PASSWORD" ]; then
-            echo "::error::NEXUS_USER / NEXUS_PASSWORD secrets are not set"; exit 1
+            echo "::error::NEXUS_USER / NEXUS_PASSWORD are not set on the nexus-release environment"; exit 1
           fi
           cat > settings.xml <<XML
           <settings><servers><server>
             <id>hec-nexus</id><username>${NEXUS_USER}</username><password>${NEXUS_PASSWORD}</password>
           </server></servers></settings>
           XML
-          mvn -B -s settings.xml deploy:deploy-file \
-            -DrepositoryId=hec-nexus \
-            -Durl=https://www.hec.usace.army.mil/nexus/repository/maven-releases/ \
-            -DgroupId=mil.army.usace.hec -DartifactId=hecdss \
-            -Dversion="${{ inputs.version }}-${{ matrix.classifier }}" \
-            -Dpackaging=zip \
-            -Dfile="hecdss-${{ inputs.version }}-${{ matrix.classifier }}.zip"
+          for classifier in darwin-x86_64 darwin-aarch64; do
+            zip=$(find artifacts -name "hecdss-${{ inputs.version }}-${classifier}.zip" | head -1)
+            if [ -z "$zip" ]; then echo "::error::missing built artifact for ${classifier}"; exit 1; fi
+            echo "Deploying $zip"
+            mvn -B -s settings.xml deploy:deploy-file \
+              -DrepositoryId=hec-nexus \
+              -Durl=https://www.hec.usace.army.mil/nexus/repository/maven-releases/ \
+              -DgroupId=mil.army.usace.hec -DartifactId=hecdss \
+              -Dversion="${{ inputs.version }}-${classifier}" \
+              -Dpackaging=zip \
+              -Dfile="$zip"
+          done
