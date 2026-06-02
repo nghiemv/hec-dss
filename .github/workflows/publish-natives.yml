@@ -1,0 +1,115 @@
+name: publish-natives
+
+# Builds the `hecdss` shared library on macOS and deploys it to HEC Nexus as
+# mil.army.usace.hec:hecdss:<version>-<classifier>@zip — the same coordinates hec-dss-java
+# consumes. HEC already publishes win-x86_64 / linux-x86_64; this fills the missing macOS
+# (darwin) binaries so hec-dss-java works on Apple hardware.
+#
+# One-time setup on the fork:
+#   * Settings > Actions > General: enable Actions (forks start disabled).
+#   * Settings > Environments: create environment `nexus-release`; add secrets NEXUS_USER and
+#     NEXUS_PASSWORD to it (deploy rights to maven-releases), plus any protection rules
+#     (required reviewers, allowed branches). The deploy job below references that environment,
+#     so the build/verify runs need no secrets and only the deploy is gated.
+#
+# Correctness: build from the source revision that matches the target version so the dylib is
+# ABI/behaviour-compatible with the published win/linux libraries of the same version. The
+# default ref (65801a2) matches 7-JA-7 — its hecdss.h is byte-identical to the 7-JA-7 zip header,
+# which the committed hec-dss-java FFM bindings were generated from. Bump both inputs together.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref/commit to build (must match the target version's source)"
+        required: true
+        default: "65801a2291ae832596657ee9766eebd8863f0c42"
+      version:
+        description: "Nexus version base, e.g. 7-JA-7"
+        required: true
+        default: "7-JA-7"
+      deploy:
+        description: "Deploy to HEC Nexus (off = build + upload artifacts only)"
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-13 is the Intel runner; macos-14 is Apple Silicon. Each builds its native arch
+          # (no cross-compile), so the binary matches the runner it was produced on.
+          - { runner: macos-13, classifier: darwin-x86_64, arch: x86_64 }
+          - { runner: macos-14, classifier: darwin-aarch64, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }}
+
+      - name: Build hecdss shared library
+        run: cmake --build build --target hecdss
+
+      - name: Stage library + header
+        run: |
+          mkdir -p stage
+          libpath=$(find build -name 'libhecdss.dylib' -type f | head -1)
+          if [ -z "$libpath" ]; then echo "::error::libhecdss.dylib not found under build/"; exit 1; fi
+          # Sanity-check the produced architecture matches the target.
+          file "$libpath"
+          lipo -archs "$libpath" || true
+          cp "$libpath" stage/
+          cp heclib/hecdss/hecdss.h stage/
+          ls -l stage
+
+      - name: Zip (library + header at archive root, matching HEC's win/linux zips)
+        run: cd stage && zip -r "../hecdss-${{ inputs.version }}-${{ matrix.classifier }}.zip" .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hecdss-${{ matrix.classifier }}
+          path: hecdss-${{ inputs.version }}-${{ matrix.classifier }}.zip
+
+  deploy:
+    needs: build
+    if: ${{ inputs.deploy }}
+    runs-on: ubuntu-latest
+    # Gating the deploy behind a protected environment keeps the Nexus write creds out of the
+    # build/verify runs and lets you require approval / restrict branches before a publish. The
+    # zips are platform-agnostic blobs, so a single ubuntu job uploads both arch artifacts.
+    environment: nexus-release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Deploy darwin zips to HEC Nexus
+        env:
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: |
+          if [ -z "$NEXUS_USER" ] || [ -z "$NEXUS_PASSWORD" ]; then
+            echo "::error::NEXUS_USER / NEXUS_PASSWORD are not set on the nexus-release environment"; exit 1
+          fi
+          cat > settings.xml <<XML
+          <settings><servers><server>
+            <id>hec-nexus</id><username>${NEXUS_USER}</username><password>${NEXUS_PASSWORD}</password>
+          </server></servers></settings>
+          XML
+          for classifier in darwin-x86_64 darwin-aarch64; do
+            zip=$(find artifacts -name "hecdss-${{ inputs.version }}-${classifier}.zip" | head -1)
+            if [ -z "$zip" ]; then echo "::error::missing built artifact for ${classifier}"; exit 1; fi
+            echo "Deploying $zip"
+            mvn -B -s settings.xml deploy:deploy-file \
+              -DrepositoryId=hec-nexus \
+              -Durl=https://www.hec.usace.army.mil/nexus/repository/maven-releases/ \
+              -DgroupId=mil.army.usace.hec -DartifactId=hecdss \
+              -Dversion="${{ inputs.version }}-${classifier}" \
+              -Dpackaging=zip \
+              -Dfile="$zip"
+          done
